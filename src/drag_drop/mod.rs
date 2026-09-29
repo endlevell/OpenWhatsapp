@@ -2,7 +2,8 @@
 
 use gtk::gio::prelude::*;
 use gtk::prelude::*;
-use webkit6::prelude::*;
+
+use crate::clipboard_paste::{self, PasteTarget, PastedFile};
 
 const ACCEPTED_MIME_TYPES: &[&str] = &[
     "text/uri-list",
@@ -17,6 +18,8 @@ const ACCEPTED_MIME_TYPES: &[&str] = &[
 ];
 const READ_MIME_TYPES: &[&str] = &["text/uri-list", "text/plain"];
 const MAX_DROP_BYTES: usize = 1024 * 1024;
+/// Files are copied into the page as base64, so keep them to a sane size.
+const MAX_DROPPED_FILE_BYTES: i64 = 64 * 1024 * 1024;
 
 /// Attaches file drag-and-drop handling to a WebKit webview.
 pub(crate) fn attach_to_webview(webview: &webkit6::WebView) {
@@ -54,36 +57,56 @@ async fn handle_drop(webview: &webkit6::WebView, drop: &gtk::gdk::Drop) -> anyho
         .await?;
     let text = String::from_utf8_lossy(bytes.as_ref());
     let uris = parse_uri_list(&text);
+    let mut files = Vec::with_capacity(uris.len());
 
-    if uris.is_empty() {
+    for uri in &uris {
+        match load_dropped_file(uri).await {
+            Ok(file) => files.push(file),
+            Err(error) => tracing::warn!(?error, uri, "skipping dropped file"),
+        }
+    }
+
+    if files.is_empty() {
         return Ok(());
     }
 
-    inject_attach_event(webview, &uris);
+    clipboard_paste::inject_paste(webview, &files, PasteTarget::Composer);
 
     Ok(())
 }
 
-fn inject_attach_event(webview: &webkit6::WebView, uris: &[String]) {
-    let script = format!(
-        "window.dispatchEvent(new CustomEvent('openwhatsapp-files-dropped', {{ detail: {{ uris: [{}] }} }}));",
-        uris.iter()
-            .map(|uri| format!("\"{}\"", escape_js_string(uri)))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+/// Reads a dropped `file://` URI into memory so it can be handed to the page;
+/// web content cannot open local paths on its own.
+async fn load_dropped_file(uri: &str) -> anyhow::Result<PastedFile> {
+    let file = gtk::gio::File::for_uri(uri);
+    let path = file
+        .path()
+        .ok_or_else(|| anyhow::anyhow!("not a local file"))?;
+    let size = file
+        .query_info_future(
+            gtk::gio::FILE_ATTRIBUTE_STANDARD_SIZE,
+            gtk::gio::FileQueryInfoFlags::NONE,
+            gtk::glib::Priority::DEFAULT,
+        )
+        .await?
+        .size();
 
-    webview.evaluate_javascript(
-        &script,
-        None,
-        None,
-        None::<&webkit6::gio::Cancellable>,
-        |result| {
-            if let Err(error) = result {
-                tracing::error!(?error, "failed to inject drop event");
-            }
-        },
-    );
+    if size > MAX_DROPPED_FILE_BYTES {
+        anyhow::bail!("file is {size} bytes, above the {MAX_DROPPED_FILE_BYTES} byte limit");
+    }
+
+    let (contents, _etag) = file.load_contents_future().await?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_owned());
+    let (content_type, _uncertain) =
+        gtk::gio::content_type_guess(Some(&path), Some(contents.as_ref()));
+    let mime_type = gtk::gio::content_type_get_mime_type(&content_type)
+        .map(|mime| mime.to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+
+    Ok(PastedFile::new(&contents, &name, &mime_type))
 }
 
 fn parse_uri_list(text: &str) -> Vec<String> {
@@ -92,23 +115,6 @@ fn parse_uri_list(text: &str) -> Vec<String> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn escape_js_string(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-
-    for character in value.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            _ => escaped.push(character),
-        }
-    }
-
-    escaped
 }
 
 #[cfg(test)]
@@ -124,10 +130,5 @@ mod tests {
                 "file:///tmp/b.pdf".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn js_string_escape_handles_quotes_and_newlines() {
-        assert_eq!(escape_js_string("a\"b\nc"), "a\\\"b\\nc");
     }
 }

@@ -12,6 +12,7 @@ use uuid::Uuid;
 use webkit6::prelude::*;
 
 use crate::accounts::Account;
+use crate::clipboard_paste;
 use crate::config::{DownloadConfig, SpellcheckConfig};
 use crate::customizations::{self, CustomizationStore};
 use crate::downloads;
@@ -190,6 +191,7 @@ fn configure_webview(
     attach_compositor_redraw_safety_net(webview);
     spellcheck::apply_to_webview(webview, spellcheck_config)?;
     drag_drop::attach_to_webview(webview);
+    clipboard_paste::attach_to_webview(webview);
     attach_load_diagnostics(webview);
     attach_notification_handlers(webview, account_id, events.clone());
     attach_unread_title_watcher(webview, account_id, events);
