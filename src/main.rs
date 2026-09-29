@@ -1,5 +1,6 @@
 mod accounts;
 mod app;
+mod clipboard_paste;
 mod config;
 mod customizations;
 mod downloads;
